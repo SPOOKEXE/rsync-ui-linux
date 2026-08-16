@@ -54,4 +54,12 @@ add_executable(rsync-ui
 target_link_libraries(rsync-ui PRIVATE imgui Threads::Threads)
 target_compile_options(rsync-ui PRIVATE -Wall -Wextra)
 
+# Release builds fold libstdc++ and libgcc into the binary. GLFW is already a
+# static library and it dlopens the X11 libraries at runtime, so what remains is
+# glibc plus the system's OpenGL, which is exactly what should come from the host.
+option(RSYNC_UI_PORTABLE "Statically link libstdc++ and libgcc for distribution" OFF)
+if(RSYNC_UI_PORTABLE)
+    target_link_options(rsync-ui PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+
 install(TARGETS rsync-ui RUNTIME DESTINATION bin)

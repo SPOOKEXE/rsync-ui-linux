@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=rsync-ui
+GenericName=rsync copy queue
+Comment=Queue rsync copies with progress, pause and resume
+Exec=rsync-ui
+Icon=rsync-ui
+Categories=Utility;FileTools;
+Terminal=false
+Keywords=rsync;copy;backup;sync;transfer;

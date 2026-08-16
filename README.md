@@ -24,6 +24,25 @@ and shows live progress.
 - **Resume**: interrupted copies continue instead of restarting, and the queue
   survives closing the app.
 
+## Install
+
+Grab either artifact from the [latest
+release](../../releases/latest). Both are x86_64 and need `rsync` on `PATH`.
+
+```sh
+# AppImage: self-contained, no install step
+chmod +x rsync-ui-x86_64.AppImage
+./rsync-ui-x86_64.AppImage
+
+# or the plain executable
+chmod +x rsync-ui-x86_64
+./rsync-ui-x86_64
+```
+
+Release builds link libstdc++ and libgcc statically and GLFW loads X11 at
+runtime, so the only hard requirements are glibc 2.35 or newer and the system's
+OpenGL libraries.
+
 ## Build
 
 ```sh
@@ -36,6 +55,17 @@ CMake fetches Dear ImGui and GLFW at configure time, so the first build needs
 network access. Building GLFW from source needs the X11 development headers
 (`sudo apt install xorg-dev` on Debian/Ubuntu). `rsync` must be on `PATH` at
 runtime.
+
+To reproduce a release build locally, including the AppImage:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DRSYNC_UI_PORTABLE=ON
+cmake --build build -j
+./packaging/make-appimage.sh build/rsync-ui dist
+```
+
+Pushing a `v*` tag runs the same steps in GitHub Actions and publishes both
+artifacts to a release.
 
 ## How resume works
 

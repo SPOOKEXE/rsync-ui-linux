@@ -1,0 +1,74 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    # Built on the oldest supported runner on purpose: the binary links against
+    # the runner's glibc, so building on ubuntu-latest would refuse to start on
+    # anything older. If this image is ever retired, moving to ubuntu-latest is
+    # the fix, at the cost of a newer glibc floor for users.
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ ninja-build \
+            xorg-dev libgl1-mesa-dev \
+            desktop-file-utils rsync
+
+      # FetchContent clones imgui and glfw on every configure, so cache them.
+      - name: Cache fetched dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRSYNC_UI_PORTABLE=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Stage the direct executable
+        run: |
+          mkdir -p dist
+          strip build/rsync-ui
+          install -m755 build/rsync-ui dist/rsync-ui-x86_64
+          ldd dist/rsync-ui-x86_64
+
+      - name: Build the AppImage
+        run: ./packaging/make-appimage.sh build/rsync-ui dist
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum rsync-ui-x86_64 rsync-ui-x86_64.AppImage | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rsync-ui-linux-x86_64
+          path: dist/*
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/rsync-ui-x86_64 \
+            dist/rsync-ui-x86_64.AppImage \
+            dist/SHA256SUMS
