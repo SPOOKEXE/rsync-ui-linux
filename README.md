@@ -3,6 +3,8 @@
 Linux rsync user interface. A single Dear ImGui window that queues rsync copies
 one after another and shows live progress.
 
+<img src="demo.png" width=800></img>
+
 ## What it does
 
 - **Sources** — a list of files or directories, each with its own `rec` checkbox.
