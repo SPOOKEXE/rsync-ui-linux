@@ -19,19 +19,24 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
+      # GLFW builds an X11 and a Wayland backend and picks between them at
+      # runtime, so both sets of headers are needed here. libwayland-dev pulls in
+      # libwayland-bin, which is where the wayland-scanner binary lives; without
+      # it GLFW's configure step fails outright.
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake g++ ninja-build \
             xorg-dev libgl1-mesa-dev \
+            libwayland-dev libxkbcommon-dev \
             desktop-file-utils rsync
 
       # FetchContent clones imgui and glfw on every configure, so cache them.
       - name: Cache fetched dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: build/_deps
           key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
@@ -56,7 +61,7 @@ jobs:
         working-directory: dist
         run: sha256sum rsync-ui-x86_64 rsync-ui-x86_64.AppImage | tee SHA256SUMS
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: rsync-ui-linux-x86_64
           path: dist/*
