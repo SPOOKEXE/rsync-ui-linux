@@ -49,6 +49,7 @@ add_executable(rsync-ui
     src/ui.cpp
     src/rsync_job.cpp
     src/job_queue.cpp
+    src/session.cpp
     src/dir_browser.cpp)
 target_link_libraries(rsync-ui PRIVATE imgui Threads::Threads)
 target_compile_options(rsync-ui PRIVATE -Wall -Wextra)

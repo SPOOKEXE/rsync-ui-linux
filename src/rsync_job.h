@@ -14,6 +14,9 @@ struct JobOptions {
     bool deleteExtra = false;
     bool compress = false;
     bool checksum = false;
+    // Keeps half-transferred files in a .rsync-partial directory so a re-run
+    // continues them instead of starting over. This is what makes resume work.
+    bool partial = true;
     std::string extraArgs;
 };
 
@@ -38,6 +41,11 @@ struct Job {
     std::string eta;
     int exitCode = -1;
     std::string error;  // last non-progress output line, shown when a job fails
+
+    // Runtime-only bookkeeping owned by JobQueue, never persisted.
+    // pid doubles as the process group id, see runRsync.
+    pid_t pid = 0;
+    bool cancelRequested = false;
 };
 
 // Builds the argv rsync is exec'd with. Exposed so the UI can show the exact command.
@@ -56,7 +64,8 @@ struct RsyncCallbacks {
         onProgress;
     // Any output line that is not a progress update (file names, errors).
     std::function<void(const std::string& line)> onLine;
-    // Hands the caller the child pid so it can signal the process to cancel it.
+    // Hands the caller the child pid, which is also its process group id, so the
+    // whole rsync tree can be stopped, continued or killed with kill(-pid, sig).
     std::function<void(pid_t)> onStarted;
 };
 

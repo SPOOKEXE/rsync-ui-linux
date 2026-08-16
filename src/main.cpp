@@ -5,7 +5,9 @@
 #include <GLFW/glfw3.h>
 
 #include <cstdio>
+#include <string>
 
+#include "session.h"
 #include "ui.h"
 
 namespace {
@@ -55,6 +57,14 @@ int main() {
     glfwSetWindowUserPointer(window, &state);
     glfwSetDropCallback(window, dropCallback);
 
+    const std::string sessionFile = sessionPath();
+    applySession(state, parseSession(readFileOrEmpty(sessionFile)));
+
+    // Saving is driven by hashing the serialized session rather than by dirty
+    // flags scattered through the UI: one place to get right, nothing to forget.
+    size_t savedHash = 0;
+    double nextSaveCheck = 0.0;
+
     while (!glfwWindowShouldClose(window)) {
         // Wait for input rather than spinning at vsync: the timeout only exists so
         // progress bars refresh while rsync runs. Idle costs almost no GPU.
@@ -75,7 +85,14 @@ int main() {
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
+
+        if (glfwGetTime() >= nextSaveCheck) {
+            nextSaveCheck = glfwGetTime() + 2.0;
+            saveSessionIfChanged(sessionFile, serializeSession(sessionFromState(state)), savedHash);
+        }
     }
+
+    saveSessionIfChanged(sessionFile, serializeSession(sessionFromState(state)), savedHash);
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();

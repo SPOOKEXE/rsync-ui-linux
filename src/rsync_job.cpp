@@ -69,6 +69,10 @@ std::vector<std::string> buildRsyncArgs(const Job& job) {
         args.push_back("--exclude=/*/*/");
     }
 
+    // rsync auto-excludes a relative partial-dir from the transfer and from
+    // --delete, so the scratch directory never leaks into the copy.
+    if (job.opts.partial) args.push_back("--partial-dir=.rsync-partial");
+
     if (job.opts.dryRun) args.push_back("-n");
     if (job.opts.deleteExtra) args.push_back("--delete");
     if (job.opts.compress) args.push_back("-z");
@@ -147,6 +151,10 @@ int runRsync(const Job& job, const RsyncCallbacks& cb) {
         return -1;
     }
     if (pid == 0) {
+        // Own process group, so pause/cancel can signal the whole rsync tree at
+        // once. A local rsync forks a generator and a receiver; signalling only
+        // the top process leaves those running.
+        setpgid(0, 0);
         close(fds[0]);
         dup2(fds[1], STDOUT_FILENO);
         dup2(fds[1], STDERR_FILENO);
@@ -155,6 +163,9 @@ int runRsync(const Job& job, const RsyncCallbacks& cb) {
         _exit(127);  // rsync not on PATH
     }
 
+    // Racing the child's own setpgid: whichever call lands first wins and the
+    // other fails harmlessly, so the group exists before onStarted is called.
+    setpgid(pid, pid);
     close(fds[1]);
     if (cb.onStarted) cb.onStarted(pid);
 

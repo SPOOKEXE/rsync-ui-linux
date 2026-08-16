@@ -5,6 +5,7 @@
 
 #include "dir_browser.h"
 #include "job_queue.h"
+#include "session.h"
 
 // Which list the folder picker is currently filling in.
 enum class BrowserTarget { None, Source, Dest, DropFolder };
@@ -33,9 +34,15 @@ struct AppState {
     BrowserTarget browserTarget = BrowserTarget::None;
     bool askDeleteConfirm = false;
     bool showLog = true;
+    int restoredJobs = 0;  // banner count after a session restore, cleared by the user
 };
 
 void applyTheme();
+
+// Session round-trip. Only unfinished jobs are carried over; done, failed and
+// cancelled rows are transient and disappear with the process.
+SessionData sessionFromState(AppState& s);
+void applySession(AppState& s, const SessionData& d);
 
 // Converts this frame's dropped paths into queued jobs or source rows.
 void handleDrops(AppState& s);

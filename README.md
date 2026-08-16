@@ -1,22 +1,28 @@
 # rsync-ui-linux
 
 Linux rsync user interface. A single Dear ImGui window that queues rsync copies
-one after another and shows live progress.
+and shows live progress.
 
 <img src="demo.png" width=800></img>
 
 ## What it does
 
-- **Sources** — a list of files or directories, each with its own `rec` checkbox.
+- **Sources**: a list of files or directories, each with its own `rec` checkbox.
   Off means "copy this folder's own files, skip its subdirectories".
-- **Destinations** — a list of target directories. Every source is copied into
+- **Destinations**: a list of target directories. Every source is copied into
   every destination, so N sources and M destinations produce N x M jobs.
-- **Drop folder** — open a directory, tick `drops copy straight here`, and
+- **Drop folder**: open a directory, tick `drops copy straight here`, and
   anything dragged onto the window is queued into that folder immediately.
   With the tick off, drops are added to the source list instead.
-- **Queue** — jobs run one at a time with a progress bar, speed and ETA.
-  A failed job goes red and the queue moves on. Hover a source cell to see the
-  exact rsync command, and the error if it failed.
+- **Queue**: jobs run with a progress bar, speed and ETA. Cancel one with the `x`
+  on its row, or all of them from the header. A failed job goes red and the queue
+  moves on. Hover a source cell to see the exact rsync command, and the error if
+  it failed.
+- **Pause**: freezes every running transfer and stops new ones starting. Resume
+  picks up exactly where it stopped.
+- **Parallel**: run up to 8 rsyncs at once. A `--delete` job always runs alone.
+- **Resume**: interrupted copies continue instead of restarting, and the queue
+  survives closing the app.
 
 ## Build
 
@@ -31,10 +37,29 @@ network access. Building GLFW from source needs the X11 development headers
 (`sudo apt install xorg-dev` on Debian/Ubuntu). `rsync` must be on `PATH` at
 runtime.
 
+## How resume works
+
+Two separate mechanisms, both on by default.
+
+**Within a file.** The `resumable` option adds `--partial-dir=.rsync-partial`.
+A cancelled transfer leaves its half-copied file in that directory, and a re-run
+picks it up instead of starting from zero. rsync excludes the directory from the
+transfer and from `--delete`, and removes it once the file completes. For very
+large files over a slow link, `--append-verify` in the extra-args box is the
+stricter version: it checksums the bytes already there and appends the rest.
+
+**Across restarts.** Sources, destinations, options and every unfinished job are
+written to `$XDG_STATE_HOME/rsync-ui/session.tsv` (usually
+`~/.local/state/rsync-ui/session.tsv`). On the next launch they come back and the
+queue starts **paused**, so nothing runs until you press Resume. Done, failed and
+cancelled rows are not saved.
+
 ## Notes
 
 - rsync is launched with `fork` + `execvp`, never through a shell, so paths with
   spaces, quotes or `$` need no escaping.
+- Each rsync gets its own process group, so pause and cancel signal the whole
+  rsync tree rather than just the top process.
 - Jobs run with `--info=progress2 --no-inc-recursive`. The second flag makes the
   percentage monotonic; without it rsync keeps discovering files mid-transfer and
   the bar slides backwards.

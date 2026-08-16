@@ -1,6 +1,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -9,46 +10,62 @@
 
 #include "rsync_job.h"
 
-// Runs queued rsync jobs one at a time on a single background thread.
-// Every accessor is safe to call from the UI thread; all shared state lives
-// behind one mutex, and the UI reads copies rather than references.
+// Runs queued rsync jobs on a pool of worker threads, at most maxParallel at a
+// time. Every accessor is safe to call from the UI thread; all shared state
+// lives behind one mutex and the UI reads copies rather than references.
 class JobQueue {
 public:
+    static constexpr int kMaxParallel = 8;
+
     JobQueue();
     ~JobQueue();
 
     JobQueue(const JobQueue&) = delete;
     JobQueue& operator=(const JobQueue&) = delete;
 
-    // Appends jobs as Pending and assigns each an id. Starts the worker if idle.
+    // Appends jobs as Pending and assigns each a fresh id.
     void enqueue(std::vector<Job> jobs);
 
-    // Snapshots for rendering. Cheap enough at this scale to copy every frame.
+    // Snapshots for rendering and for saving the session.
     std::vector<Job> jobs();
     std::vector<std::string> log();
 
-    void cancelCurrent();  // SIGTERM the running rsync, leave the rest of the queue alone
-    void cancelAll();      // cancel the running job and mark everything pending as cancelled
-    void clearFinished();  // drop done/failed/cancelled rows
+    void cancelJob(int id);  // SIGTERM one job's process group
+    void cancelAll();        // cancel everything running and drop everything pending
+    void clearFinished();    // drop done/failed/cancelled rows
     void clearLog();
+
+    // Pausing SIGSTOPs every running rsync and stops workers picking up new jobs.
+    void setPaused(bool paused);
+    bool paused();
+
+    void setMaxParallel(int n);  // clamped to [1, kMaxParallel]
+    int maxParallel();
 
     bool busy();  // true while anything is running or waiting to run
 
+    // Bumped on every mutation, so callers can cheaply notice the queue changed.
+    uint64_t generation();
+
 private:
     void worker();
-    Job* findById(int id);                        // caller must hold mutex_
+    bool canStartLocked() const;
+    Job* firstPendingLocked();
+    Job* findByIdLocked(int id);
     void appendLogLocked(const std::string& line);
+    void signalRunningLocked(int sig);
 
     std::mutex mutex_;
     std::condition_variable cv_;
     std::vector<Job> jobs_;
     std::deque<std::string> log_;
+    std::vector<std::thread> threads_;
     int nextId_ = 1;
-    int runningId_ = 0;
-    pid_t childPid_ = -1;
-    bool cancelRequested_ = false;
+    int runningCount_ = 0;
+    int maxParallel_ = 1;
+    bool paused_ = false;
     bool stop_ = false;
-    std::thread thread_;
+    uint64_t generation_ = 1;
 };
 
 // Cross-products sources and destinations into the job list the queue runs.

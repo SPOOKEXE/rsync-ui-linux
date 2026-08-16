@@ -72,17 +72,47 @@ void drawHeader(AppState& s, const std::vector<Job>& jobs) {
     }
 
     ImGui::SameLine();
-    if (ImGui::Button("Cancel current")) s.queue.cancelCurrent();
+    const bool paused = s.queue.paused();
+    if (ImGui::Button(paused ? "Resume" : "Pause", ImVec2(80, 0))) s.queue.setPaused(!paused);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("freezes running transfers and stops new ones starting");
+    }
+
     ImGui::SameLine();
     if (ImGui::Button("Cancel all")) s.queue.cancelAll();
     ImGui::SameLine();
     if (ImGui::Button("Clear finished")) s.queue.clearFinished();
+
+    ImGui::SameLine();
+    ImGui::TextUnformatted("parallel");
+    ImGui::SameLine();
+    static const char* kParallelItems[] = {"1", "2", "3", "4", "5", "6", "7", "8"};
+    static_assert(IM_ARRAYSIZE(kParallelItems) == JobQueue::kMaxParallel,
+                  "dropdown must list every allowed parallel count");
+    int parallelIndex = s.queue.maxParallel() - 1;
+    ImGui::SetNextItemWidth(60);
+    if (ImGui::Combo("##parallel", &parallelIndex, kParallelItems,
+                     IM_ARRAYSIZE(kParallelItems))) {
+        s.queue.setMaxParallel(parallelIndex + 1);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("how many rsyncs run at once\n--delete jobs always run alone");
+    }
+
     ImGui::SameLine();
     ImGui::Checkbox("Log", &s.showLog);
 
     ImGui::SameLine();
-    ImGui::TextColored(kDim, "  |  %d running   %d pending   %d done   %d failed", running,
-                       pending, done, failed);
+    ImGui::TextColored(paused ? kBad : kDim,
+                       "  |  %s%d running   %d pending   %d done   %d failed",
+                       paused ? "PAUSED   " : "", running, pending, done, failed);
+
+    if (s.restoredJobs > 0) {
+        ImGui::TextColored(kOk, "restored %d unfinished job(s) from the last session, queue is paused",
+                           s.restoredJobs);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("ok")) s.restoredJobs = 0;
+    }
 }
 
 void drawSources(AppState& s) {
@@ -186,6 +216,14 @@ void drawOptions(AppState& s) {
     ImGui::Checkbox("compress -z", &s.opts.compress);
     ImGui::SameLine();
     ImGui::Checkbox("checksum -c", &s.opts.checksum);
+    ImGui::SameLine();
+    ImGui::Checkbox("resumable", &s.opts.partial);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "--partial-dir=.rsync-partial\n"
+            "keeps half-copied files so an interrupted job continues\n"
+            "instead of starting over");
+    }
 
     ImGui::SetNextItemWidth(-1);
     if (ImGui::InputTextWithHint("##extra", "extra rsync args, e.g. --exclude=\"*.tmp\" --bwlimit=10M",
@@ -220,12 +258,13 @@ void drawDropFolder(AppState& s) {
     }
 }
 
-void drawQueue(const std::vector<Job>& jobs, float height) {
+void drawQueue(AppState& s, const std::vector<Job>& jobs, float height) {
     ImGui::TextUnformatted("QUEUE");
     const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
                                   ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
-    if (ImGui::BeginTable("queue", 7, flags, ImVec2(0, height))) {
+    if (ImGui::BeginTable("queue", 8, flags, ImVec2(0, height))) {
         ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoResize, 24);
         ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 36);
         ImGui::TableSetupColumn("state", ImGuiTableColumnFlags_WidthFixed, 80);
         ImGui::TableSetupColumn("progress", ImGuiTableColumnFlags_WidthFixed, 150);
@@ -235,39 +274,50 @@ void drawQueue(const std::vector<Job>& jobs, float height) {
         ImGui::TableSetupColumn("eta", ImGuiTableColumnFlags_WidthFixed, 70);
         ImGui::TableHeadersRow();
 
+        const bool paused = s.queue.paused();
         for (const auto& j : jobs) {
             ImGui::TableNextRow();
+            ImGui::PushID(j.id);
 
             ImGui::TableSetColumnIndex(0);
-            ImGui::Text("%d", j.id);
+            const bool cancellable =
+                j.state == JobState::Pending || j.state == JobState::Running;
+            if (cancellable && ImGui::SmallButton("x")) s.queue.cancelJob(j.id);
 
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextColored(stateColor(j.state), "%s", jobStateName(j.state));
+            ImGui::Text("%d", j.id);
 
             ImGui::TableSetColumnIndex(2);
+            // A running job under a paused queue is stopped, not progressing.
+            const bool frozen = paused && j.state == JobState::Running;
+            ImGui::TextColored(frozen ? kDim : stateColor(j.state), "%s",
+                               frozen ? "paused" : jobStateName(j.state));
+
+            ImGui::TableSetColumnIndex(3);
             char overlay[32];
             std::snprintf(overlay, sizeof(overlay), "%d%%", static_cast<int>(j.percent * 100));
             ImGui::ProgressBar(j.percent, ImVec2(-1, 0), overlay);
 
-            ImGui::TableSetColumnIndex(3);
+            ImGui::TableSetColumnIndex(4);
             ImGui::TextUnformatted(j.source.c_str());
             if (ImGui::IsItemHovered()) {
-                Job copy = j;
-                std::string cmd = joinArgs(buildRsyncArgs(copy));
+                std::string cmd = joinArgs(buildRsyncArgs(j));
                 if (j.state == JobState::Failed && !j.error.empty()) {
                     cmd += "\n\nexit " + std::to_string(j.exitCode) + ": " + j.error;
                 }
                 ImGui::SetTooltip("%s", cmd.c_str());
             }
 
-            ImGui::TableSetColumnIndex(4);
+            ImGui::TableSetColumnIndex(5);
             ImGui::TextUnformatted(j.dest.c_str());
 
-            ImGui::TableSetColumnIndex(5);
+            ImGui::TableSetColumnIndex(6);
             ImGui::TextUnformatted(j.speed.c_str());
 
-            ImGui::TableSetColumnIndex(6);
+            ImGui::TableSetColumnIndex(7);
             ImGui::TextUnformatted(j.eta.c_str());
+
+            ImGui::PopID();
         }
         ImGui::EndTable();
     }
@@ -370,6 +420,42 @@ void applyTheme() {
     c[ImGuiCol_ModalWindowDimBg] = ImVec4(0, 0, 0, 0.65f);
 }
 
+SessionData sessionFromState(AppState& s) {
+    SessionData d;
+    d.sources = s.sources;
+    d.dests = s.dests;
+    d.opts = s.opts;
+    d.dropFolder = s.dropFolder;
+    d.dropStraightToFolder = s.dropStraightToFolder;
+    d.dropRecursive = s.dropRecursive;
+    d.maxParallel = s.queue.maxParallel();
+    for (const auto& j : s.queue.jobs()) {
+        // A job that was mid-flight when the app died is unfinished work, so it
+        // is saved as something to pick up again.
+        if (j.state == JobState::Pending || j.state == JobState::Running) d.jobs.push_back(j);
+    }
+    return d;
+}
+
+void applySession(AppState& s, const SessionData& d) {
+    s.sources = d.sources;
+    s.dests = d.dests;
+    s.opts = d.opts;
+    s.dropFolder = d.dropFolder;
+    s.dropStraightToFolder = d.dropStraightToFolder;
+    s.dropRecursive = d.dropRecursive;
+    std::snprintf(s.extraBuf, sizeof(s.extraBuf), "%s", s.opts.extraArgs.c_str());
+    s.queue.setMaxParallel(d.maxParallel);
+
+    if (!d.jobs.empty()) {
+        // Pause before enqueueing so restored work never starts behind the
+        // user's back on launch.
+        s.queue.setPaused(true);
+        s.queue.enqueue(d.jobs);
+        s.restoredJobs = static_cast<int>(d.jobs.size());
+    }
+}
+
 void handleDrops(AppState& s) {
     if (s.droppedPaths.empty()) return;
 
@@ -432,7 +518,7 @@ void drawUi(AppState& s) {
     const float logHeight = s.showLog ? 170.0f : 0.0f;
     float queueHeight = ImGui::GetContentRegionAvail().y - logHeight;
     if (queueHeight < 120.0f) queueHeight = 120.0f;
-    drawQueue(jobs, queueHeight - ImGui::GetTextLineHeightWithSpacing());
+    drawQueue(s, jobs, queueHeight - ImGui::GetTextLineHeightWithSpacing());
     drawLog(s);
 
     std::string picked;
