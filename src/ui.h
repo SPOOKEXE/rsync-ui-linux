@@ -1,0 +1,44 @@
+#pragma once
+
+#include <string>
+#include <vector>
+
+#include "dir_browser.h"
+#include "job_queue.h"
+
+// Which list the folder picker is currently filling in.
+enum class BrowserTarget { None, Source, Dest, DropFolder };
+
+struct AppState {
+    std::vector<SourceEntry> sources;
+    std::vector<std::string> dests;
+    JobOptions opts;
+
+    // Requirement 3: with a drop folder set and this enabled, anything dropped on
+    // the window is queued straight into that folder instead of joining the source list.
+    std::string dropFolder;
+    bool dropStraightToFolder = false;
+    bool dropRecursive = true;
+
+    JobQueue queue;
+
+    // Paths handed over by the GLFW drop callback, drained once per frame.
+    std::vector<std::string> droppedPaths;
+
+    // UI-only scratch state.
+    char sourceBuf[1024] = {};
+    char destBuf[1024] = {};
+    char extraBuf[512] = {};
+    DirBrowser browser;
+    BrowserTarget browserTarget = BrowserTarget::None;
+    bool askDeleteConfirm = false;
+    bool showLog = true;
+};
+
+void applyTheme();
+
+// Converts this frame's dropped paths into queued jobs or source rows.
+void handleDrops(AppState& s);
+
+// Draws the whole interface into one full-viewport window.
+void drawUi(AppState& s);
