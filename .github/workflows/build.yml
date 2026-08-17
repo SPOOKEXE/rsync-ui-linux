@@ -32,7 +32,8 @@ jobs:
             cmake g++ ninja-build \
             xorg-dev libgl1-mesa-dev \
             libwayland-dev libxkbcommon-dev \
-            desktop-file-utils rsync
+            desktop-file-utils rsync \
+            xvfb xdotool x11-apps libgl1-mesa-dri python3-pil
 
       # FetchContent clones imgui and glfw on every configure, so cache them.
       - name: Cache fetched dependencies
@@ -46,6 +47,18 @@ jobs:
 
       - name: Build
         run: cmake --build build
+
+      # Compiling proves nothing about whether the window opens, so run the app
+      # on a virtual display and check it paints a frame.
+      - name: Smoke test
+        run: ./tools/smoke-test.sh smoke
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: smoke-screenshot
+          path: smoke/startup.png
+          if-no-files-found: warn
 
       - name: Stage the direct executable
         run: |
