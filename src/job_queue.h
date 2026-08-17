@@ -35,6 +35,10 @@ public:
     void clearFinished();    // drop done/failed/cancelled rows
     void clearLog();
 
+    // Answers a job waiting in Review. Conflicts with allow=false become a skip
+    // list; the job then re-runs live without scanning again.
+    void resolveJob(int id, const std::vector<Conflict>& decisions);
+
     // Pausing SIGSTOPs every running rsync and stops workers picking up new jobs.
     void setPaused(bool paused);
     bool paused();
@@ -48,12 +52,23 @@ public:
     uint64_t generation();
 
 private:
+    // How one rsync invocation ended. Cancellation is reported separately because
+    // rsync exits non-zero precisely because it was killed.
+    struct PhaseResult {
+        bool ok = false;
+        bool cancelled = false;
+        int exitCode = -1;
+    };
+
     void worker();
+    RsyncCallbacks makeCallbacks(int id, std::vector<Conflict>* collect);
+    PhaseResult runPhase(const Job& job, RunMode mode, int id, std::vector<Conflict>* collect);
+    void finishLocked(int id, JobState state, const std::string& note);
     bool canStartLocked() const;
     Job* firstPendingLocked();
     Job* findByIdLocked(int id);
     void appendLogLocked(const std::string& line);
-    void signalRunningLocked(int sig);
+    void signalActiveLocked(int sig);
 
     std::mutex mutex_;
     std::condition_variable cv_;

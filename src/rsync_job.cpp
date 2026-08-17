@@ -11,10 +11,21 @@
 const char* jobStateName(JobState s) {
     switch (s) {
         case JobState::Pending: return "pending";
-        case JobState::Running: return "running";
+        case JobState::Scanning: return "dry";
+        case JobState::Review: return "conflicts";
+        case JobState::Running: return "live";
         case JobState::Done: return "done";
         case JobState::Failed: return "failed";
         case JobState::Cancelled: return "cancelled";
+    }
+    return "?";
+}
+
+const char* conflictPolicyName(ConflictPolicy p) {
+    switch (p) {
+        case ConflictPolicy::Pause: return "Pause on any conflict";
+        case ConflictPolicy::WorkAround: return "Work around, then resolve";
+        case ConflictPolicy::Skip: return "Skip conflicts";
     }
     return "?";
 }
@@ -53,8 +64,14 @@ std::string joinArgs(const std::vector<std::string>& args) {
     return out;
 }
 
-std::vector<std::string> buildRsyncArgs(const Job& job) {
+std::vector<std::string> buildRsyncArgs(const Job& job, RunMode mode) {
     std::vector<std::string> args{"rsync", "--info=progress2", "--no-inc-recursive"};
+
+    if (mode == RunMode::DryScan) {
+        // -n changes nothing, -i lists what would change, one line per item.
+        args.push_back("-n");
+        args.push_back("-i");
+    }
 
     if (job.opts.archive) args.push_back("-a");
 
@@ -69,9 +86,19 @@ std::vector<std::string> buildRsyncArgs(const Job& job) {
         args.push_back("--exclude=/*/*/");
     }
 
+    // Placed ahead of any filter the user typed, because rsync's first matching
+    // rule wins: a file the user chose to skip stays skipped even if a later
+    // --include would have matched it. Excluding a path also protects it from
+    // --delete, which is what makes "keep the destination's copy" work for
+    // deletions as well as overwrites.
+    if (mode == RunMode::Live && !job.excludeFrom.empty()) {
+        args.push_back("--exclude-from=" + job.excludeFrom);
+    }
+
     // rsync auto-excludes a relative partial-dir from the transfer and from
-    // --delete, so the scratch directory never leaks into the copy.
-    if (job.opts.partial) args.push_back("--partial-dir=.rsync-partial");
+    // --delete, so the scratch directory never leaks into the copy. Pointless
+    // during a dry scan, where nothing is written.
+    if (job.opts.partial && mode == RunMode::Live) args.push_back("--partial-dir=.rsync-partial");
 
     if (job.opts.dryRun) args.push_back("-n");
     if (job.opts.deleteExtra) args.push_back("--delete");
@@ -100,10 +127,19 @@ std::string trim(const std::string& s) {
     return s.substr(b, e - b + 1);
 }
 
+// Pulls "R/T" out of a trailing "(xfr#12, to-chk=340/401)".
+void parseToCheck(const std::string& line, RsyncProgress& p) {
+    const size_t at = line.find("to-chk=");
+    if (at == std::string::npos) return;
+    const size_t slash = line.find('/', at);
+    if (slash == std::string::npos) return;
+    p.checkRemaining = std::atoi(line.c_str() + at + 7);
+    p.checkTotal = std::atoi(line.c_str() + slash + 1);
+}
+
 // Recognises an rsync --info=progress2 line, which looks like:
 //   1,234,567  45%   12.34MB/s    0:00:12 (xfr#3, to-chk=10/20)
-bool parseProgress(const std::string& line, float& pct, std::string& transferred,
-                   std::string& speed, std::string& eta) {
+bool parseProgress(const std::string& line, RsyncProgress& p) {
     std::vector<std::string> tok;
     std::string cur;
     for (char c : line) {
@@ -122,17 +158,18 @@ bool parseProgress(const std::string& line, float& pct, std::string& transferred
         if (!std::isdigit(static_cast<unsigned char>(c)) && c != ',' && c != '.') return false;
     }
 
-    pct = static_cast<float>(std::atoi(tok[1].c_str())) / 100.0f;
-    transferred = tok[0];
-    speed = tok[2];
-    eta = tok[3];
+    p.percent = static_cast<float>(std::atoi(tok[1].c_str())) / 100.0f;
+    p.transferred = tok[0];
+    p.speed = tok[2];
+    p.eta = tok[3];
+    parseToCheck(line, p);
     return true;
 }
 
 }  // namespace
 
-int runRsync(const Job& job, const RsyncCallbacks& cb) {
-    std::vector<std::string> args = buildRsyncArgs(job);
+int runRsync(const Job& job, RunMode mode, const RsyncCallbacks& cb) {
+    std::vector<std::string> args = buildRsyncArgs(job, mode);
 
     // execvp wants a NULL-terminated char* array. Going through argv directly
     // (no shell) means paths with spaces, quotes or $ need no escaping at all.
@@ -178,10 +215,9 @@ int runRsync(const Job& job, const RsyncCallbacks& cb) {
         std::string line = trim(pending);
         pending.clear();
         if (line.empty()) return;
-        float pct = 0.0f;
-        std::string transferred, speed, eta;
-        if (parseProgress(line, pct, transferred, speed, eta)) {
-            if (cb.onProgress) cb.onProgress(pct, transferred, speed, eta);
+        RsyncProgress p;
+        if (parseProgress(line, p)) {
+            if (cb.onProgress) cb.onProgress(p);
         } else if (cb.onLine) {
             cb.onLine(line);
         }

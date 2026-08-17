@@ -60,24 +60,27 @@ std::vector<std::string> splitTabs(const std::string& line) {
 const char* b(bool v) { return v ? "1" : "0"; }
 bool toBool(const std::string& s) { return s == "1"; }
 
-// Options occupy a fixed run of six flags followed by the free-text extra args,
-// shared by the "opt" line and every "job" line.
+// Options occupy a fixed run of six flags, the conflict policy, then the
+// free-text extra args, shared by the "opt" line and every "job" line.
 void writeOpts(std::ostringstream& os, const JobOptions& o) {
     os << '\t' << b(o.archive) << '\t' << b(o.dryRun) << '\t' << b(o.deleteExtra) << '\t'
        << b(o.compress) << '\t' << b(o.checksum) << '\t' << b(o.partial) << '\t'
-       << escape(o.extraArgs);
+       << static_cast<int>(o.onConflict) << '\t' << escape(o.extraArgs);
 }
 
-// Reads those seven fields starting at `at`. Returns false if the line is short.
+// Reads those eight fields starting at `at`. Returns false if the line is short.
 bool readOpts(const std::vector<std::string>& f, size_t at, JobOptions& o) {
-    if (f.size() < at + 7) return false;
+    if (f.size() < at + 8) return false;
     o.archive = toBool(f[at]);
     o.dryRun = toBool(f[at + 1]);
     o.deleteExtra = toBool(f[at + 2]);
     o.compress = toBool(f[at + 3]);
     o.checksum = toBool(f[at + 4]);
     o.partial = toBool(f[at + 5]);
-    o.extraArgs = unescape(f[at + 6]);
+    const int policy = std::atoi(f[at + 6].c_str());
+    o.onConflict = policy >= 0 && policy <= 2 ? static_cast<ConflictPolicy>(policy)
+                                              : ConflictPolicy::WorkAround;
+    o.extraArgs = unescape(f[at + 7]);
     return true;
 }
 
@@ -97,7 +100,7 @@ std::string sessionPath() {
 
 std::string serializeSession(const SessionData& d) {
     std::ostringstream os;
-    os << "v1\n";
+    os << "v2\n";
 
     os << "opt";
     writeOpts(os, d.opts);
@@ -125,7 +128,7 @@ SessionData parseSession(const std::string& text) {
     SessionData d;
     std::istringstream is(text);
     std::string line;
-    if (!std::getline(is, line) || line != "v1") return d;
+    if (!std::getline(is, line) || line != "v2") return d;
 
     while (std::getline(is, line)) {
         if (line.empty()) continue;

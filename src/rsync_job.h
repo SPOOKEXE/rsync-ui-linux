@@ -6,6 +6,17 @@
 #include <string>
 #include <vector>
 
+#include "conflicts.h"
+
+// What a job does when its dry scan finds conflicts.
+enum class ConflictPolicy {
+    Pause,       // transfer nothing, wait for the user to decide
+    WorkAround,  // copy everything that is not in conflict, then wait
+    Skip,        // copy everything that is not in conflict and call it done
+};
+
+const char* conflictPolicyName(ConflictPolicy p);
+
 // rsync flags shared by every job in a batch. Recursion is per-source, so it
 // lives on Job rather than here.
 struct JobOptions {
@@ -17,16 +28,19 @@ struct JobOptions {
     // Keeps half-transferred files in a .rsync-partial directory so a re-run
     // continues them instead of starting over. This is what makes resume work.
     bool partial = true;
+    ConflictPolicy onConflict = ConflictPolicy::WorkAround;
     std::string extraArgs;
 };
 
-enum class JobState { Pending, Running, Done, Failed, Cancelled };
+// Every job is scanned before it copies anything, so Scanning always comes
+// first and Review only happens when that scan found something.
+enum class JobState { Pending, Scanning, Review, Running, Done, Failed, Cancelled };
 
 const char* jobStateName(JobState s);
 
-// One rsync invocation: a single source copied into a single destination directory.
-// The live fields below are written by the queue worker and read by the UI thread,
-// always under JobQueue's mutex.
+// One rsync invocation: a single source copied into a single destination
+// directory. The live fields below are written by the queue worker and read by
+// the UI thread, always under JobQueue's mutex.
 struct Job {
     int id = 0;
     std::string source;
@@ -35,7 +49,7 @@ struct Job {
     JobOptions opts;
 
     JobState state = JobState::Pending;
-    float percent = 0.0f;     // 0..1, parsed from rsync --info=progress2
+    float percent = 0.0f;     // 0..1 for whichever phase is active
     std::string transferred;  // bytes moved so far, verbatim from rsync
     std::string speed;
     std::string eta;
@@ -46,10 +60,17 @@ struct Job {
     // pid doubles as the process group id, see runRsync.
     pid_t pid = 0;
     bool cancelRequested = false;
+    std::vector<Conflict> conflicts;
+    std::string excludeFrom;  // skip list for the live run, empty when nothing is skipped
+    bool resolved = false;    // the user has answered, so go straight to the live run
 };
 
+// A dry scan lists what would change without touching anything; the live run
+// does the work.
+enum class RunMode { DryScan, Live };
+
 // Builds the argv rsync is exec'd with. Exposed so the UI can show the exact command.
-std::vector<std::string> buildRsyncArgs(const Job& job);
+std::vector<std::string> buildRsyncArgs(const Job& job, RunMode mode);
 
 // Splits a raw extra-args string into tokens, honouring "double quoted" runs.
 std::vector<std::string> splitArgs(const std::string& text);
@@ -57,12 +78,20 @@ std::vector<std::string> splitArgs(const std::string& text);
 // Joins argv into a shell-ish string for display only. Never fed back to a shell.
 std::string joinArgs(const std::vector<std::string>& args);
 
+struct RsyncProgress {
+    float percent = 0.0f;     // meaningful during a live run
+    std::string transferred;  // copied verbatim from rsync's progress line
+    std::string speed;
+    std::string eta;
+    // From the "(xfr#N, to-chk=R/T)" suffix. This is the honest measure of a dry
+    // scan, whose byte percentage counts transfers that never happen.
+    int checkRemaining = -1;
+    int checkTotal = -1;
+};
+
 struct RsyncCallbacks {
-    // percent is 0..1; the string fields are copied verbatim from rsync's progress line.
-    std::function<void(float percent, const std::string& transferred,
-                       const std::string& speed, const std::string& eta)>
-        onProgress;
-    // Any output line that is not a progress update (file names, errors).
+    std::function<void(const RsyncProgress&)> onProgress;
+    // Any output line that is not a progress update: itemize output, errors.
     std::function<void(const std::string& line)> onLine;
     // Hands the caller the child pid, which is also its process group id, so the
     // whole rsync tree can be stopped, continued or killed with kill(-pid, sig).
@@ -71,4 +100,4 @@ struct RsyncCallbacks {
 
 // Runs rsync to completion in the calling thread. Returns the process exit code,
 // 128+signal if it was killed, or -1 if the child could not be spawned.
-int runRsync(const Job& job, const RsyncCallbacks& cb);
+int runRsync(const Job& job, RunMode mode, const RsyncCallbacks& cb);

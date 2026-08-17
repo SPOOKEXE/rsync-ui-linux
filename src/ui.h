@@ -35,6 +35,13 @@ struct AppState {
     bool askDeleteConfirm = false;
     bool showLog = true;
     int restoredJobs = 0;  // banner count after a session restore, cleared by the user
+
+    // Conflict resolution modal. The edited copy lives here rather than in the
+    // queue so the worker is never looking at half-made decisions.
+    int conflictJobId = 0;
+    bool openConflictModal = false;
+    std::vector<Conflict> conflictEdit;
+    std::string conflictSummary;
 };
 
 void applyTheme();

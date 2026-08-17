@@ -15,6 +15,7 @@ namespace {
 const ImVec4 kDim(0.55f, 0.55f, 0.55f, 1.0f);
 const ImVec4 kOk(0.45f, 0.85f, 0.45f, 1.0f);
 const ImVec4 kBad(1.00f, 0.35f, 0.35f, 1.0f);
+const ImVec4 kWarn(1.00f, 0.75f, 0.30f, 1.0f);
 
 std::string trim(const std::string& s) {
     size_t b = s.find_first_not_of(" \t\n\r");
@@ -37,9 +38,14 @@ std::string normalizePath(const std::string& raw) {
 
 void clearBuf(char* buf, size_t cap) { std::memset(buf, 0, cap); }
 
+// True while an rsync child is actually running, in either phase.
+bool isLive(JobState s) { return s == JobState::Scanning || s == JobState::Running; }
+
 ImVec4 stateColor(JobState s) {
     switch (s) {
         case JobState::Pending: return kDim;
+        case JobState::Scanning: return ImVec4(0.55f, 0.75f, 1.0f, 1.0f);
+        case JobState::Review: return kWarn;
         case JobState::Running: return ImVec4(1, 1, 1, 1);
         case JobState::Done: return kOk;
         case JobState::Failed: return kBad;
@@ -225,6 +231,25 @@ void drawOptions(AppState& s) {
             "instead of starting over");
     }
 
+    // Every job dry-runs before it copies anything; this decides what happens
+    // when that scan finds files it would overwrite or delete.
+    ImGui::TextUnformatted("on conflict");
+    ImGui::SameLine();
+    static const char* kPolicyItems[] = {"Pause on any conflict", "Work around, then resolve",
+                                         "Skip conflicts"};
+    int policy = static_cast<int>(s.opts.onConflict);
+    ImGui::SetNextItemWidth(230);
+    if (ImGui::Combo("##policy", &policy, kPolicyItems, IM_ARRAYSIZE(kPolicyItems))) {
+        s.opts.onConflict = static_cast<ConflictPolicy>(policy);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Pause: copy nothing until you decide\n"
+            "Work around: copy everything safe now, decide the rest after\n"
+            "Skip: copy everything safe and never ask");
+    }
+    ImGui::SameLine();
+
     ImGui::SetNextItemWidth(-1);
     if (ImGui::InputTextWithHint("##extra", "extra rsync args, e.g. --exclude=\"*.tmp\" --bwlimit=10M",
                                  s.extraBuf, sizeof(s.extraBuf))) {
@@ -280,28 +305,44 @@ void drawQueue(AppState& s, const std::vector<Job>& jobs, float height) {
             ImGui::PushID(j.id);
 
             ImGui::TableSetColumnIndex(0);
-            const bool cancellable =
-                j.state == JobState::Pending || j.state == JobState::Running;
+            const bool cancellable = j.state == JobState::Pending ||
+                                     j.state == JobState::Review || isLive(j.state);
             if (cancellable && ImGui::SmallButton("x")) s.queue.cancelJob(j.id);
 
             ImGui::TableSetColumnIndex(1);
             ImGui::Text("%d", j.id);
 
             ImGui::TableSetColumnIndex(2);
-            // A running job under a paused queue is stopped, not progressing.
-            const bool frozen = paused && j.state == JobState::Running;
+            // A job under a paused queue is stopped, not progressing.
+            const bool frozen = paused && isLive(j.state);
             ImGui::TextColored(frozen ? kDim : stateColor(j.state), "%s",
                                frozen ? "paused" : jobStateName(j.state));
 
             ImGui::TableSetColumnIndex(3);
-            char overlay[32];
-            std::snprintf(overlay, sizeof(overlay), "%d%%", static_cast<int>(j.percent * 100));
-            ImGui::ProgressBar(j.percent, ImVec2(-1, 0), overlay);
+            if (j.state == JobState::Review) {
+                // The one row that wants an answer rather than a percentage.
+                if (ImGui::SmallButton("Resolve conflicts")) {
+                    s.conflictJobId = j.id;
+                    s.conflictEdit = j.conflicts;
+                    s.conflictSummary = j.source + "  ->  " + j.dest;
+                    s.openConflictModal = true;
+                }
+            } else {
+                char overlay[48];
+                const char* phase = j.state == JobState::Scanning ? "dry " : "";
+                std::snprintf(overlay, sizeof(overlay), "%s%d%%", phase,
+                              static_cast<int>(j.percent * 100));
+                ImGui::ProgressBar(j.percent, ImVec2(-1, 0), overlay);
+            }
 
             ImGui::TableSetColumnIndex(4);
             ImGui::TextUnformatted(j.source.c_str());
             if (ImGui::IsItemHovered()) {
-                std::string cmd = joinArgs(buildRsyncArgs(j));
+                // Show the command for the phase this row is in, since the dry
+                // scan and the live run are not the same argv.
+                const RunMode mode =
+                    j.state == JobState::Scanning ? RunMode::DryScan : RunMode::Live;
+                std::string cmd = joinArgs(buildRsyncArgs(j, mode));
                 if (j.state == JobState::Failed && !j.error.empty()) {
                     cmd += "\n\nexit " + std::to_string(j.exitCode) + ": " + j.error;
                 }
@@ -336,6 +377,158 @@ void drawLog(AppState& s) {
     ImGui::EndChild();
 }
 
+// Counts how many conflicts are currently set to go ahead.
+int countAllowed(const std::vector<Conflict>& cs) {
+    int n = 0;
+    for (const auto& c : cs) {
+        if (c.allow) ++n;
+    }
+    return n;
+}
+
+void drawConflictModal(AppState& s) {
+    if (s.openConflictModal) {
+        ImGui::OpenPopup("Resolve conflicts");
+        s.openConflictModal = false;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(940, 560), ImGuiCond_Appearing);
+    bool stayOpen = true;
+    if (!ImGui::BeginPopupModal("Resolve conflicts", &stayOpen,
+                                ImGuiWindowFlags_NoSavedSettings)) {
+        return;
+    }
+
+    auto& cs = s.conflictEdit;
+    ImGui::TextColored(kDim, "job %d   %s", s.conflictJobId, s.conflictSummary.c_str());
+    ImGui::Text("%zu conflict(s), %d set to apply", cs.size(), countAllowed(cs));
+    ImGui::Separator();
+
+    bool apply = false;
+    if (ImGui::BeginTabBar("conflicttabs")) {
+        if (ImGui::BeginTabItem("Quick actions")) {
+            ImGui::TextColored(kDim, "each of these decides every file at once");
+            ImGui::Spacing();
+
+            if (ImGui::Button("Overwrite everything", ImVec2(240, 0))) {
+                for (auto& c : cs) c.allow = true;
+                apply = true;
+            }
+            ImGui::TextColored(kDim, "destination copies are replaced, deletions go ahead");
+            ImGui::Spacing();
+
+            if (ImGui::Button("Keep the destination", ImVec2(240, 0))) {
+                for (auto& c : cs) c.allow = false;
+                apply = true;
+            }
+            ImGui::TextColored(kDim, "nothing already there is touched, new files still copy");
+            ImGui::Spacing();
+
+            if (ImGui::Button("Only where the source is newer", ImVec2(240, 0))) {
+                for (auto& c : cs) {
+                    c.allow = c.kind == ConflictKind::Overwrite && c.srcKnown && c.dstKnown &&
+                              c.srcMtime > c.dstMtime;
+                }
+                apply = true;
+            }
+            ImGui::TextColored(kDim, "deletions are held back, since nothing can be newer");
+            ImGui::Spacing();
+            ImGui::Separator();
+
+            if (ImGui::Button("Cancel this job", ImVec2(240, 0))) {
+                s.queue.cancelJob(s.conflictJobId);
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("View files")) {
+            if (ImGui::SmallButton("tick all")) {
+                for (auto& c : cs) c.allow = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("untick all")) {
+                for (auto& c : cs) c.allow = false;
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("newer only")) {
+                for (auto& c : cs) {
+                    c.allow = c.kind == ConflictKind::Overwrite && c.srcKnown && c.dstKnown &&
+                              c.srcMtime > c.dstMtime;
+                }
+            }
+            ImGui::SameLine();
+            ImGui::TextColored(kDim, "ticked = apply the change, unticked = leave the destination alone");
+
+            const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+            if (ImGui::BeginTable("conflicts", 6, flags, ImVec2(0, -44))) {
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 26);
+                ImGui::TableSetupColumn("what", ImGuiTableColumnFlags_WidthFixed, 70);
+                ImGui::TableSetupColumn("path", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                ImGui::TableSetupColumn("size now -> new", ImGuiTableColumnFlags_WidthFixed, 170);
+                ImGui::TableSetupColumn("modified now", ImGuiTableColumnFlags_WidthFixed, 130);
+                ImGui::TableSetupColumn("modified new", ImGuiTableColumnFlags_WidthFixed, 130);
+                ImGui::TableHeadersRow();
+
+                for (size_t i = 0; i < cs.size(); ++i) {
+                    Conflict& c = cs[i];
+                    ImGui::TableNextRow();
+                    ImGui::PushID(static_cast<int>(i));
+
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Checkbox("##allow", &c.allow);
+
+                    ImGui::TableSetColumnIndex(1);
+                    if (c.kind == ConflictKind::Delete) {
+                        ImGui::TextColored(kBad, "delete");
+                    } else {
+                        ImGui::TextUnformatted("overwrite");
+                    }
+
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::TextUnformatted(c.path.c_str());
+
+                    ImGui::TableSetColumnIndex(3);
+                    if (c.kind == ConflictKind::Delete) {
+                        ImGui::TextUnformatted(
+                            c.dstKnown ? formatSize(c.dstSize).c_str() : "-");
+                    } else {
+                        ImGui::Text("%s -> %s", c.dstKnown ? formatSize(c.dstSize).c_str() : "?",
+                                    c.srcKnown ? formatSize(c.srcSize).c_str() : "?");
+                    }
+
+                    ImGui::TableSetColumnIndex(4);
+                    ImGui::TextUnformatted(c.dstKnown ? formatTime(c.dstMtime).c_str() : "-");
+
+                    ImGui::TableSetColumnIndex(5);
+                    // A newer source is the usual reason to accept an overwrite,
+                    // so it is worth making obvious at a glance.
+                    const bool srcNewer = c.srcKnown && c.dstKnown && c.srcMtime > c.dstMtime;
+                    ImGui::TextColored(srcNewer ? kOk : ImVec4(1, 1, 1, 1), "%s",
+                                       c.srcKnown ? formatTime(c.srcMtime).c_str() : "-");
+
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+
+            if (ImGui::Button("Apply", ImVec2(140, 0))) apply = true;
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(100, 0))) ImGui::CloseCurrentPopup();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+
+    if (apply) {
+        s.queue.resolveJob(s.conflictJobId, cs);
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 void drawDeleteConfirm(AppState& s) {
     if (s.askDeleteConfirm) {
         ImGui::OpenPopup("Enable --delete?");
@@ -343,6 +536,12 @@ void drawDeleteConfirm(AppState& s) {
     }
     // Passing a p_open flag gives the popup a close button and makes Escape work.
     // Dismissing it any way other than "Enable it" leaves --delete off.
+    //
+    // BeginPopupModal writes false into p_open whenever the popup is merely not
+    // open, not just when the X is clicked, so the flag only carries meaning on a
+    // frame where the popup was actually up. Without this guard every later frame
+    // reads as "closed by the X" and switches --delete straight back off.
+    const bool wasOpen = ImGui::IsPopupOpen("Enable --delete?");
     bool stayOpen = true;
     if (ImGui::BeginPopupModal("Enable --delete?", &stayOpen,
                                ImGuiWindowFlags_AlwaysAutoResize |
@@ -363,7 +562,7 @@ void drawDeleteConfirm(AppState& s) {
         }
         ImGui::EndPopup();
     }
-    if (!stayOpen) s.opts.deleteExtra = false;
+    if (wasOpen && !stayOpen) s.opts.deleteExtra = false;
 }
 
 }  // namespace
@@ -430,9 +629,12 @@ SessionData sessionFromState(AppState& s) {
     d.dropRecursive = s.dropRecursive;
     d.maxParallel = s.queue.maxParallel();
     for (const auto& j : s.queue.jobs()) {
-        // A job that was mid-flight when the app died is unfinished work, so it
-        // is saved as something to pick up again.
-        if (j.state == JobState::Pending || j.state == JobState::Running) d.jobs.push_back(j);
+        // Anything not finished is work to pick up again. Conflicts themselves
+        // are not saved: the disk may have moved on, so a restored job re-scans.
+        if (j.state != JobState::Done && j.state != JobState::Failed &&
+            j.state != JobState::Cancelled) {
+            d.jobs.push_back(j);
+        }
     }
     return d;
 }
@@ -531,6 +733,7 @@ void drawUi(AppState& s) {
         }
         s.browserTarget = BrowserTarget::None;
     }
+    drawConflictModal(s);
     drawDeleteConfirm(s);
 
     ImGui::End();

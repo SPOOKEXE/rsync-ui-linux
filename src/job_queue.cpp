@@ -3,11 +3,15 @@
 #include <signal.h>
 
 #include <algorithm>
+#include <cstdio>
 
 namespace {
 constexpr size_t kMaxLogLines = 2000;
 
 std::string tag(int id) { return "[" + std::to_string(id) + "] "; }
+
+// True while a job owns a live rsync child, in either of its two phases.
+bool isActive(JobState s) { return s == JobState::Scanning || s == JobState::Running; }
 }  // namespace
 
 JobQueue::JobQueue() {
@@ -20,12 +24,12 @@ JobQueue::~JobQueue() {
         std::lock_guard<std::mutex> lk(mutex_);
         stop_ = true;
         for (auto& j : jobs_) {
-            if (j.state == JobState::Running) j.cancelRequested = true;
+            if (isActive(j.state)) j.cancelRequested = true;
         }
         // A stopped process ignores SIGTERM until it runs again, so continue
         // first or a paused job would keep the worker blocked forever.
-        signalRunningLocked(SIGCONT);
-        signalRunningLocked(SIGTERM);
+        signalActiveLocked(SIGCONT);
+        signalActiveLocked(SIGTERM);
     }
     cv_.notify_all();
     for (auto& t : threads_) {
@@ -63,9 +67,9 @@ void JobQueue::cancelJob(int id) {
         std::lock_guard<std::mutex> lk(mutex_);
         Job* j = findByIdLocked(id);
         if (!j) return;
-        if (j->state == JobState::Pending) {
+        if (j->state == JobState::Pending || j->state == JobState::Review) {
             j->state = JobState::Cancelled;
-        } else if (j->state == JobState::Running) {
+        } else if (isActive(j->state)) {
             j->cancelRequested = true;
             if (j->pid > 0) {
                 kill(-j->pid, SIGCONT);
@@ -81,11 +85,13 @@ void JobQueue::cancelAll() {
     {
         std::lock_guard<std::mutex> lk(mutex_);
         for (auto& j : jobs_) {
-            if (j.state == JobState::Pending) j.state = JobState::Cancelled;
-            if (j.state == JobState::Running) j.cancelRequested = true;
+            if (j.state == JobState::Pending || j.state == JobState::Review) {
+                j.state = JobState::Cancelled;
+            }
+            if (isActive(j.state)) j.cancelRequested = true;
         }
-        signalRunningLocked(SIGCONT);
-        signalRunningLocked(SIGTERM);
+        signalActiveLocked(SIGCONT);
+        signalActiveLocked(SIGTERM);
         ++generation_;
     }
     cv_.notify_all();
@@ -113,7 +119,7 @@ void JobQueue::setPaused(bool paused) {
         std::lock_guard<std::mutex> lk(mutex_);
         if (paused_ == paused) return;
         paused_ = paused;
-        signalRunningLocked(paused ? SIGSTOP : SIGCONT);
+        signalActiveLocked(paused ? SIGSTOP : SIGCONT);
         appendLogLocked(paused ? "queue paused" : "queue resumed");
         ++generation_;
     }
@@ -144,7 +150,7 @@ int JobQueue::maxParallel() {
 bool JobQueue::busy() {
     std::lock_guard<std::mutex> lk(mutex_);
     for (auto& j : jobs_) {
-        if (j.state == JobState::Pending || j.state == JobState::Running) return true;
+        if (j.state == JobState::Pending || isActive(j.state)) return true;
     }
     return false;
 }
@@ -170,9 +176,9 @@ Job* JobQueue::firstPendingLocked() {
     return nullptr;
 }
 
-void JobQueue::signalRunningLocked(int sig) {
+void JobQueue::signalActiveLocked(int sig) {
     for (auto& j : jobs_) {
-        if (j.state == JobState::Running && j.pid > 0) kill(-j.pid, sig);
+        if (isActive(j.state) && j.pid > 0) kill(-j.pid, sig);
     }
 }
 
@@ -186,7 +192,7 @@ bool JobQueue::canStartLocked() const {
     bool deleteRunning = false;
     for (const auto& j : jobs_) {
         if (!next && j.state == JobState::Pending) next = &j;
-        if (j.state == JobState::Running && j.opts.deleteExtra) deleteRunning = true;
+        if (isActive(j.state) && j.opts.deleteExtra) deleteRunning = true;
     }
     if (!next) return false;
 
@@ -202,10 +208,104 @@ void JobQueue::appendLogLocked(const std::string& line) {
     while (log_.size() > kMaxLogLines) log_.pop_front();
 }
 
+// Builds the callback set shared by the dry scan and the live run. Everything it
+// touches is addressed by job id, so a concurrent clearFinished() cannot dangle.
+RsyncCallbacks JobQueue::makeCallbacks(int id, std::vector<Conflict>* collect) {
+    RsyncCallbacks cb;
+    cb.onStarted = [this, id](pid_t pid) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        Job* j = findByIdLocked(id);
+        if (!j) return;
+        j->pid = pid;
+        // A pause or cancel that landed between claiming the job and the fork
+        // would otherwise be lost, so apply it as soon as we have a pid.
+        if (j->cancelRequested) {
+            kill(-pid, SIGTERM);
+        } else if (paused_) {
+            kill(-pid, SIGSTOP);
+        }
+    };
+    cb.onProgress = [this, id](const RsyncProgress& p) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        Job* j = findByIdLocked(id);
+        if (!j) return;
+        if (j->state == JobState::Scanning) {
+            // A dry run's byte percentage counts transfers that never happen, so
+            // the file counter is the only honest measure of scan progress.
+            if (p.checkTotal > 0) {
+                const int done = p.checkTotal - p.checkRemaining;
+                j->percent = static_cast<float>(done) / static_cast<float>(p.checkTotal);
+            }
+        } else {
+            j->percent = p.percent;
+            j->transferred = p.transferred;
+            j->speed = p.speed;
+            j->eta = p.eta;
+        }
+        ++generation_;
+    };
+    cb.onLine = [this, id, collect](const std::string& line) {
+        if (collect) {
+            Conflict c;
+            if (parseItemizeLine(line, c)) {
+                collect->push_back(std::move(c));
+                return;  // itemize output is data, not log noise
+            }
+            // A dry scan also prints lines for new files, which are not conflicts
+            // and would drown the log, so only real messages get through.
+            if (line.size() > 12 && (line[0] == '>' || line[0] == 'c' || line[0] == '.')) return;
+        }
+        std::lock_guard<std::mutex> lk(mutex_);
+        appendLogLocked(tag(id) + line);
+        if (Job* j = findByIdLocked(id)) j->error = line;
+    };
+    return cb;
+}
+
+// Runs one phase and reports how it ended. Cancel wins over a non-zero exit,
+// since rsync exits non-zero precisely because it was killed.
+JobQueue::PhaseResult JobQueue::runPhase(const Job& job, RunMode mode, int id,
+                                         std::vector<Conflict>* collect) {
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        appendLogLocked(tag(id) + "$ " + joinArgs(buildRsyncArgs(job, mode)));
+    }
+    const int code = runRsync(job, mode, makeCallbacks(id, collect));
+
+    std::lock_guard<std::mutex> lk(mutex_);
+    PhaseResult r;
+    r.exitCode = code;
+    if (Job* j = findByIdLocked(id)) {
+        j->pid = 0;
+        j->exitCode = code;
+        r.cancelled = j->cancelRequested;
+    }
+    r.ok = !r.cancelled && code == 0;
+    return r;
+}
+
+void JobQueue::finishLocked(int id, JobState state, const std::string& note) {
+    if (Job* j = findByIdLocked(id)) {
+        j->state = state;
+        if (state == JobState::Done) {
+            j->percent = 1.0f;
+            j->error.clear();
+        }
+        j->cancelRequested = false;
+        if (!j->excludeFrom.empty()) {
+            ::remove(j->excludeFrom.c_str());
+            j->excludeFrom.clear();
+        }
+    }
+    appendLogLocked(tag(id) + note);
+    ++generation_;
+}
+
 void JobQueue::worker() {
     for (;;) {
         Job current;
         int id = 0;
+        bool needsScan = false;
         {
             std::unique_lock<std::mutex> lk(mutex_);
             cv_.wait(lk, [&] { return stop_ || canStartLocked(); });
@@ -214,7 +314,10 @@ void JobQueue::worker() {
             Job* next = firstPendingLocked();
             if (!next) continue;
 
-            next->state = JobState::Running;
+            // A job the user already answered goes straight to the live run; its
+            // skip list is the answer and re-scanning would only ask again.
+            needsScan = !next->resolved;
+            next->state = needsScan ? JobState::Scanning : JobState::Running;
             next->percent = 0.0f;
             next->cancelRequested = false;
             next->pid = 0;
@@ -222,68 +325,129 @@ void JobQueue::worker() {
             id = next->id;
             ++runningCount_;
             ++generation_;
-            appendLogLocked(tag(id) + "$ " + joinArgs(buildRsyncArgs(current)));
         }
 
-        RsyncCallbacks cb;
-        cb.onStarted = [this, id](pid_t pid) {
-            std::lock_guard<std::mutex> lk(mutex_);
-            Job* j = findByIdLocked(id);
-            if (!j) return;
-            j->pid = pid;
-            // A pause or cancel that landed between claiming the job and the fork
-            // would otherwise be lost, so apply it as soon as we have a pid.
-            if (j->cancelRequested) {
-                kill(-pid, SIGTERM);
-            } else if (paused_) {
-                kill(-pid, SIGSTOP);
+        std::vector<Conflict> conflicts;
+        bool goLive = true;
+
+        if (needsScan) {
+            const PhaseResult scan = runPhase(current, RunMode::DryScan, id, &conflicts);
+            if (!scan.ok) {
+                std::lock_guard<std::mutex> lk(mutex_);
+                --runningCount_;
+                finishLocked(id, scan.cancelled ? JobState::Cancelled : JobState::Failed,
+                             scan.cancelled ? "cancelled during dry scan"
+                                            : "dry scan failed, exit " +
+                                                  std::to_string(scan.exitCode));
+                if (stop_) return;
+                cv_.notify_all();
+                continue;
             }
-        };
-        cb.onProgress = [this, id](float pct, const std::string& transferred,
-                                   const std::string& speed, const std::string& eta) {
-            std::lock_guard<std::mutex> lk(mutex_);
-            if (Job* j = findByIdLocked(id)) {
-                j->percent = pct;
-                j->transferred = transferred;
-                j->speed = speed;
-                j->eta = eta;
+
+            for (auto& c : conflicts) fillConflictDetails(current.source, current.dest, c);
+
+            if (!conflicts.empty()) {
+                std::vector<std::string> skip;
+                skip.reserve(conflicts.size());
+                for (const auto& c : conflicts) skip.push_back(c.path);
+
+                std::lock_guard<std::mutex> lk(mutex_);
+                Job* j = findByIdLocked(id);
+                appendLogLocked(tag(id) + std::to_string(conflicts.size()) +
+                                " conflict(s), policy: " +
+                                conflictPolicyName(current.opts.onConflict));
+                if (j) j->conflicts = conflicts;
+
+                if (current.opts.onConflict == ConflictPolicy::Pause) {
+                    --runningCount_;
+                    finishLocked(id, JobState::Review, "waiting for a decision");
+                    goLive = false;
+                } else {
+                    // Both other policies copy what is safe now and differ only in
+                    // whether the conflicts come back to the user afterwards.
+                    const std::string file = writeSkipFile(skip);
+                    if (j) {
+                        j->excludeFrom = file;
+                        j->state = JobState::Running;
+                        j->percent = 0.0f;
+                        current = *j;
+                    }
+                    ++generation_;
+                }
+            } else {
+                std::lock_guard<std::mutex> lk(mutex_);
+                if (Job* j = findByIdLocked(id)) {
+                    j->state = JobState::Running;
+                    j->percent = 0.0f;
+                    current = *j;
+                }
                 ++generation_;
             }
-        };
-        cb.onLine = [this, id](const std::string& line) {
-            std::lock_guard<std::mutex> lk(mutex_);
-            appendLogLocked(tag(id) + line);
-            if (Job* j = findByIdLocked(id)) j->error = line;
-        };
+        }
 
-        int code = runRsync(current, cb);
+        if (!goLive) {
+            cv_.notify_all();
+            continue;
+        }
+
+        const PhaseResult live = runPhase(current, RunMode::Live, id, nullptr);
 
         {
             std::lock_guard<std::mutex> lk(mutex_);
             --runningCount_;
-            if (Job* j = findByIdLocked(id)) {
-                j->pid = 0;
-                j->exitCode = code;
-                if (j->cancelRequested) {
-                    j->state = JobState::Cancelled;
-                    appendLogLocked(tag(id) + "cancelled");
-                } else if (code == 0) {
-                    j->state = JobState::Done;
-                    j->percent = 1.0f;
-                    j->error.clear();
-                    appendLogLocked(tag(id) + "done");
-                } else {
-                    j->state = JobState::Failed;
-                    if (code == 127) j->error = "rsync not found on PATH";
-                    appendLogLocked(tag(id) + "failed, exit " + std::to_string(code));
+            if (live.cancelled) {
+                finishLocked(id, JobState::Cancelled, "cancelled");
+            } else if (!live.ok) {
+                if (Job* j = findByIdLocked(id); j && live.exitCode == 127) {
+                    j->error = "rsync not found on PATH";
                 }
-                j->cancelRequested = false;
+                finishLocked(id, JobState::Failed,
+                             "failed, exit " + std::to_string(live.exitCode));
+            } else if (!conflicts.empty() &&
+                       current.opts.onConflict == ConflictPolicy::WorkAround) {
+                finishLocked(id, JobState::Review,
+                             "safe files copied, " + std::to_string(conflicts.size()) +
+                                 " conflict(s) waiting");
+            } else if (!conflicts.empty() &&
+                       current.opts.onConflict == ConflictPolicy::Skip) {
+                finishLocked(id, JobState::Done,
+                             "done, skipped " + std::to_string(conflicts.size()) +
+                                 " conflict(s)");
+            } else {
+                finishLocked(id, JobState::Done, "done");
             }
-            ++generation_;
             if (stop_) return;
         }
         cv_.notify_all();
     }
+}
+
+void JobQueue::resolveJob(int id, const std::vector<Conflict>& decisions) {
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        Job* j = findByIdLocked(id);
+        if (!j || j->state != JobState::Review) return;
+
+        std::vector<std::string> skip;
+        for (const auto& c : decisions) {
+            if (!c.allow) skip.push_back(c.path);
+        }
+        if (!j->excludeFrom.empty()) {
+            ::remove(j->excludeFrom.c_str());
+            j->excludeFrom.clear();
+        }
+        if (!skip.empty()) j->excludeFrom = writeSkipFile(skip);
+
+        j->conflicts = decisions;
+        j->resolved = true;
+        j->state = JobState::Pending;
+        j->percent = 0.0f;
+        appendLogLocked(tag(id) + "resolved: " +
+                        std::to_string(decisions.size() - skip.size()) + " applied, " +
+                        std::to_string(skip.size()) + " kept as-is");
+        ++generation_;
+    }
+    cv_.notify_all();
 }
 
 std::vector<Job> buildJobs(const std::vector<SourceEntry>& sources,
